@@ -1,0 +1,221 @@
+## Slurm in Python
+
+A package called simple_slurm is available in the madpy3 environment. Check <a href="https://pypi.org/project/simple-slurm/" > pypi.org </a> for package documentation and examples. 
+
+## Slurm and Snakemake
+
+Existing snakemake pipelines can be run on the cluster (almost) without change, using a parameter file (cluster.json) snakemake is told how jobs have to be submitted. Below is an example setup of a normal  snakefile which maps a number of samples to a genome. This demonstration can be copied and  run using the following commands: 
+
+```
+
+cp -r /zfs/omics/software/doc/Crunchomics_intro/SnakeDemo .
+
+cd SnakeDemo/
+
+# 3 files and an empty directory are copied 
+
+# Snakemake has to be available use 
+# source /zfs/omics/software/v_envs/madpy3/bin/activate
+# if which snakemake comes back without result 
+
+sbatch snakemake.cmd
+
+```
+Check the snakefile using 
+```
+cat Snakefile
+```
+
+Snakefile is a typical snakemake input file to trim and map some samples, but the process should work for any Snakefile.  The snakefile can be processed unchanged by snakemake utilizing the cluster using the a paramter file: 
+```
+#cluster.json
+{
+    "__default__" :
+    {
+        "time" : "00:30:00",
+        "n" : 1,
+        "c" : 1,
+        "memory"    : "2G",
+        "partition" : "all",
+        "output"    : "logs/slurm-%A_{rule}.{wildcards}.out",
+        "error"     : "logs/slurm-%A_{rule}.{wildcards}.err",
+    },
+    "align_to_database" :
+    {
+        "time" : "02:00:00",
+        "memory"    : "10G",
+        "c" : 8
+    },
+    "trim_read" :
+    {
+        "time" : "01:00:00",
+        "c" : 2
+    } 
+}
+
+```
+In the parameter file the options values can be specified for how snakemake has to configure the slurm jobs. In it the number of cores, the amount of memory etc. is given for the rules. If the name of the rule  is not given snakemake uses the values given in ```__default__```
+
+Using the ```--cluster``` and ```--cluster-config``` parameters snakemake is able replace the job execution commands with slurm batch jobs. 
+```
+snakemake -j 8 --cluster-config cluster.json --cluster "sbatch  -p {cluster.partition} -n {cluster.n}  -c {cluster.c} -t {cluster.time} --mem {cluster.memory} -o {cluster.output} "
+```
+
+The command above can be wrapped into an sbatch script (the file: snakemake.cmd)  In this way the snakemake program itself runs as a slurm job. Note that sbatch commands executed from within an sbatch job will run in a new and separate allocation independent of the allocation from which sbatch is run. Whille he snakemake program itself runs on a single core the batches it runs like the mapping tasks can use 8 cores.   
+
+The mapping of  parameters defined in the cluster.json file to the sbatch command. Snakemake takes care that jobs are submitted using the paramters in the cluster.json file. By default the parameters in ```__default__``` are used. For rules that match a clause in the cluster.json file for example ```align_to_database``` changes from the default can be included for example the the number of cores (8 instead of 1) and the time (2 hour intead of 30 minutes). 
+As mentioned in the introduction snakefiles can be run **almost** unchanged. Some rules do very little actual work and it make little sense to setup and scedule a job for it for example creating a directory. These rules can be declared as ```localrules``` at the top of the snakefile. This means snakemake will execute them directly instead of submitting them as a slurm job. Also depending on if and how thread counts are dealt with in the snakefile tweaking can improve the utilization of the allocated resources.  
+
+The snakemake parameter ```-j``` which normally limits the number of cores used by snakemake limits the number of concurrently submitted jobs regardless of the number of cores each job allocates. Setting -j to high values such as 999  as is done in some examples on the internet is usually not a good idea as it easily might claim the complete cluster. 
+
+Using snakemake in combination with the local scratch partition for temporary adds an extra challenge. The main mode of operation of snakemake is checking the existence of files however a snakemake process running on the headnode can not access the scratch on the nodes. A possibility is to configure snakemake (in cluster.json) to run on a single node and to combine that with running snakemake itself using sbatch in the selected node. 
+
+# Debugging Slurm jobs
+
+If things do not run as expected there are a number of tools and tricks to find out why. 
+
+*   Initially ```squeue``` can be used to get the state of the job. Is it in the queue, running or ended. A job which request resources which are not available is queued until the resources become available. If a jobs ask for 6 nodes it will be queued but never run as there are only 5 compute nodes. 
+*   Check the output file of the batchjob (slurm_[jobid].out or the name given using --output parameter).  Use ```cat slurm_[jobid].out``` or ```tail slurm_[jobid].out``` to check what the job sent to its standard output. 
+*   To see if the job runs as expected, an additional interactive job can be started on the node the job is running on using ```srun -w [nodeX] --pty bash -i ```.  The commands ```top``` and ```htop``` are useful to see which programs are running and ifthe program is  using the allocated resources as expected.  
+*   If it is not possible to allocate a job on the node an option is to directly ssh into node. This is only possible if you have an active job on the particular node. 
+*   A common problem is lack of memory. Memory is also limited in by the slurm allocation. The default memory allocation is 100MB. While fine for some it is not enough for  many jobs. Some jobs simple give up with an error if they don't have enough memory. Others try to make the best of it.  This mith result jobs which are expected to complete in a couple of hours run for days. A telltale sign of this happening is that memory usage shown by top is close to or equal to the allocation asked for. While setting up jobs keep in mind the compute nodes have 512GB each. That is  8G for each of the 64 cores on average. Don't allocate what you do not need and might be used by others but it is not unreasonable to allocate 128GB of memory for a 16-core job.   
+
+# Use of the local NVMe storage on the compute nodes
+
+Each compute node in the cluster has 7.3TB local and very fast NVMe storage available in /scratch. By storing temporary and/or much accessed data on the scratch disk, file access times can be improved significantly. It also reduces the load on the filer which will benefit all users.  However as local storage it can be only accessed on a particular node. So either data has to be synchronized over all nodes, or jobs have to be fixed on particular nodes using the ```-w flag``` 
+
+*  You might remember that in the _Multithreaded bowtie2 example_ we used the local /scratch disk to copy the genome index and the fastq files to. The alignment job was calculated (in this particular case on cn001).
+    *  These files are ___not___ automatically removed when the job has finished. So multiple jobs can access and further process data in scratch. 
+    * To prevent /scratch from filling up, files which have not been accessed (read or written) for (currently) a month are removed. The time unused files are removed might be reduced if the file system fills up too quickely. 
+    *  This policy makes it possible to reuse large files on the local /scratch disk on a compute node. For instance, look at the scratch of cn001:
+```
+    srun -n1 -w omics-cn001 ls -lh /scratch
+```
+*  <img src="img/slurm8.png" height="120px" width="480px"  />  
+
+   *  Here we make use of the genome index on cn001 while doing an alignment with 2 new files (save the file below as align_Mycoplasma3.sh):
+
+```   
+#!/bin/bash
+#
+#SBATCH --job-name=align_Mycoplasma
+#SBATCH --output=res_alignjob.txt
+#
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --time=10:00
+#SBATCH --mem-per-cpu=2000
+
+WD="/scratch/$USER"
+mkdir -p $WD    
+cd $WD
+
+#test if the Mycoplasma genome is already there, download it and build the index if not.
+fl="GCF_000027325.1_ASM2732v1_genomic.fna.gz"
+if [ ! -f "${fl}" ]; then
+    srun wget https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/027/325/GCF_000027325.1_ASM2732v1/GCF_000027325.1_ASM2732v1_genomic.fna.gz -P ./
+    srun bowtie2-build GCF_000027325.1_ASM2732v1_genomic.fna.gz MG37
+fi
+
+#only download the 2 illumina files if they are not there
+fl="ERR486828_1.fastq.gz"
+if [ ! -f "${fl}" ]; then
+srun wget ftp://ftp.sra.ebi.ac.uk/vol1/fastq/ERR486/ERR486828/ERR486828_1.fastq.gz -P ./
+fi
+
+fl="ERR486828_2.fastq.gz"
+if [ ! -f "${fl}" ]; then
+srun wget ftp://ftp.sra.ebi.ac.uk/vol1/fastq/ERR486/ERR486828/ERR486828_2.fastq.gz -P ./
+fi
+
+date
+srun bowtie2 -x MG37 -1 ERR486828_1.fastq.gz -2 ERR486828_2.fastq.gz --very-fast -p $SLURM_CPUS_PER_TASK -S /zfs/omics/personal/${USER}/result_ERR486828.sam
+date
+``` 
+*  execute with ```sbatch -w omics-cn001 align_Mycoplasma3.sh```  
+*  from ```tail -n21 res_alignjob.txt```: 
+    *  <img src="img/slurm9.png" height="260px" width="440px"  /> 
+    *  I conclude the script succeeded.
+*  look at the /scratch directory:
+
+```
+    srun -n1 -w omics-cn001 ls -lh /scratch
+```
+*  <img src="img/slurm10.png" height="150px" width="630px"  />  
+*  Indeed, the index MG37 is reused (timestamp 12:00) and the two fastq files ending on 28 are newly downloaded (timestamp 18:07).
+
+*  Obviously, this way of working is especially useful if there is a lot of IO. The size of the local scratch is net 7.3 TB.
+
+```
+srun -n1 -w omics-cn001 df -h /scratch
+```
+# Docker / Singularity Containers
+
+Containers are software environments which make it possible to distrubute  applications along with all the dependencies needed and run these on all computers which have the container engine installed. **Docker** is a well know container platform. For security reasons the Docker engine is not available on Omics. **Singularity** is an alternative to Docker which is better suited for running in a multi-user plaform such as Omics. Singularity is able to deal with Docker containers and many run without problems. 
+
+## Singularity hub
+
+
+```
+singularity pull singularity-images.sif shub://vsoch/singularity-images
+singularity run lolcow.sif 
+singularity run lolcow.sif 
+```
+
+## Docker hub
+
+
+```
+singularity build megahit docker://vout/megahit
+cat /etc/*release
+#CentOS Linux release 7.8.2003 (Core)
+singularity shell megahit
+#DISTRIB_ID=Ubuntu
+#DISTRIB_RELEASE=18.04
+#DISTRIB_CODENAME=bionic
+exit
+rm -rf ~/assembly
+singularity run megahit -v
+singularity run megahit -1 ERR486840_1.fastq.gz -2 ERR486840_2.fastq.gz -o ./assembly
+awk '/^>/ {print}' assembly/final.contigs.fa | wc -l
+#22 
+
+#Run this in a SLURM batch job:
+sbatch batch_megahit.txt 
+
+#!/bin/bash
+#SBATCH --job-name=assembly_gen.        # Job name
+
+echo "Running megahit" 
+
+cd # go to home
+
+rm -rf assembly
+
+singularity run megahit -t 8 -1 ERR486840_1.fastq.gz -2 ERR486840_2.fastq.gz -o ./assembly 
+awk '/^>/ {print}' assembly/final.contigs.fa | wc -l
+
+```
+
+
+## Personal RStudio on Crunchomics.
+
+For people who can not do without Rstudio there is an option to run a private server using a singularity image on the head node : 
+
+*  Pick a port number between 2000-64000. For example ```PORT=8878```
+*  Check if it is available:  If ```nc localhost $PORT``` reacts with ```Ncat: No route to host``` it is almost certainly available. If you get any other response the port is in use and another port will have to be picked.  
+
+Start rstudio (in screen to keep it alive after logging out) by the command
+
+```RSTUDIO_PASSWORD="*******" singularity run --bind /zfs/omics/personal/${USER}:/mnt  /zfs/omics/software/lib/images/singularity/singularity-rstudio.simg --www-port $PORT --auth-none 0   --auth-pam-helper rstudio_auth```
+
+Replace the ****** with a password (Do not use the UvAnetID password here!!) 
+     --www-port  should point to picked port
+      --bind is optional. It can be used to map a directory into the machine to access data outside your home directory. 
+
+The machine can be accessed only from omics-h0. You can run firefox and open the url localhost:PORT (where PORT is your picked port).   Another option to set up port forwarding in ssh on the machine you are connecting from:   
+  ```ssh -L 8080:localhost:PORT [UvAnetID]@omics-h0.science.uva.nl```
+The -L forwards the port on omics-h0 to port 8080 on your local machine so opening localhost:8080 on your local machine will connect to the rstudio-server 
+    
+
+
